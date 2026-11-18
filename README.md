@@ -20,7 +20,7 @@
 * **Exact Locations:**
   * `FileController.php` (lines 12–16): `$f->owner = User::find($f->owner_id); $f->tags = Tag::where('file_id', $f->id)->get();`
   * `2024_03_01_create_files_table.php` (lines 4–9): Missing indexes on `account_id` and `name`.
-* **Fix:** Eager-load relations and enforce pagination via Eloquent (`File::with(['owner', 'tags'])->where('account_id', ...)->paginate(50)`), and add a composite index on `(account_id, name)`.
+* **Fix:** Eager-load relations and enforce pagination via Eloquent (`File::with(['owner', 'tags'])->where('account_id', ...)->paginate($request->integer('per_page', 50))`), and add a composite index on `(account_id, name)`.
 
 #### **BRD-309 (P2): Duplicate Records & Silent Job Failures**
 * **Root Cause:** `SyncFileJob::handle()` unconditionally calls `File::create()` on incoming webhooks, while the database lacks a unique constraint on `(account_id, external_id)`. Reconnecting cloud storage re-syncs existing files, creating duplicates. Furthermore, a blanket `catch (\Exception $e)` logs `'Sync failed'` and returns normally without rethrowing, marking failing jobs as successful and masking alerts.

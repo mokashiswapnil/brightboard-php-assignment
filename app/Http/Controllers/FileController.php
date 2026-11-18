@@ -10,11 +10,14 @@ use Illuminate\Http\Request;
 
 class FileController extends Controller
 {
-    // GET /api/files?search=... used by the file list screen
+    // GET /api/files?search=...&per_page=... used by the file list screen
     public function index(Request $request): JsonResponse
     {
         $search = (string) $request->query('search', '');
         $accountId = $request->user()->account_id;
+
+        // Dynamic pagination from request with sensible bounds (default 50, max 100)
+        $perPage = min(max((int) $request->query('per_page', 50), 1), 100);
 
         // BRD-301 & BRD-304 Fix: Parameterized query builder prevents SQL injection;
         // Eager-loading ('owner', 'tags') eliminates N+1 queries; pagination bounds memory
@@ -29,7 +32,7 @@ class FileController extends Controller
                 'tags:id,file_id,name',
             ])
             ->orderBy('id', 'desc')
-            ->paginate(50);
+            ->paginate($perPage);
 
         return response()->json($files);
     }
