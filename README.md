@@ -1,83 +1,143 @@
-# Brightboard — Laravel PHP Engineer Take-Home Assignment
+# Brightboard — PHP Engineer Take-Home Assignment
 
-[![PHP Version](https://img.shields.io/badge/PHP-8.2-777BB4.svg)](https://www.php.net/)
-[![Laravel Version](https://img.shields.io/badge/Laravel-9.x-FF2D20.svg)](https://laravel.com/)
-[![License](https://img.shields.io/badge/License-Proprietary-blue.svg)](#)
-
-This repository contains the complete fix, refactored code files, test suite, and written submission for the **Brightboard PHP Engineer Take-Home Assignment**.
+> **Submission Format:** Markdown document (max 2 pages). Contains answers to Part 1 and Part 2, and the fixes for the files listed in Appendix A.
 
 ---
 
-## 📄 Submission Document
+## Part 1 — Find the bugs
 
-The official response document answering all prompts in **Part 1 (Bug Analysis & System Checks)** and **Part 2 (Sync Job Rewrite & Migration)** is available in [`SUBMISSION.md`](./SUBMISSION.md).
+### 1. Ticket Analysis
+
+* **BRD-301 (P1) — Single quote breaks file search with database error:**
+  * **Cause:** Raw string concatenation directly interpolates unescaped user input into the SQL query string, causing a SQL injection syntax error. Because `APP_DEBUG=true` in production, Laravel outputs the full SQL query and exception trace.
+  * **Appendix A Lines:** `A1. FileController.php` (lines 10–12) and `A4. Server settings` (line 3).
+  * **Fix:** Use Eloquent query builder with automatic parameter bindings (`File::where('account_id', $user->account_id)->where('name', 'like', "%{$search}%")`) and set `APP_DEBUG=false` in production `.env`.
+
+* **BRD-304 (P2) — Slow file list (>20s) and 800+ queries:**
+  * **Cause:** Severe $N+1$ query problem with unpaginated full-table scanning and unindexed lookups. Looping through all files runs two individual queries per record (`User::find()` and `Tag::where()`), generating $1 + 2N$ queries (e.g., 801 queries for 400 files).
+  * **Appendix A Lines:** `A1. FileController.php` (lines 14–17, 19) and `A2. Migration` (lines 10–18).
+  * **Fix:** Eager-load relationships (`File::with(['owner', 'tags'])`), enforce pagination (`paginate(50)`), and index `(account_id, name)`.
+
+* **BRD-309 (P2) — Duplicate files after cloud reconnect; sync alerts show nothing:**
+  * **Cause:** Lack of idempotency in `SyncFileJob` and missing unique constraint on `(account_id, external_id)`. Reconnecting cloud storage triggers syncs for existing files, unconditionally running `File::create()`. Moreover, a broad `catch (\Exception $e)` silently swallows all exceptions without failing the job, hiding failures from alert monitors.
+  * **Appendix A Lines:** `A3. SyncFileJob.php` (lines 18–23, 26–29) and `A2. Migration` (lines 10–18).
+  * **Fix:** Add a composite unique index on `['account_id', 'external_id']` in the migration, switch to `File::updateOrCreate()`, and rethrow transient exceptions or call `$this->fail($e)`.
 
 ---
 
-## 📁 Repository Structure ("Files Only")
+### 2. Other Problems Not in Any Ticket (Most Serious First)
+1. **Broken Multi-Tenant Isolation (IDOR) in `FileController::show()` and `store()`:** `File::findOrFail($id)` and `File::create($request->all())` lack tenant scoping and validation, allowing users to view any tenant's files and mass-assign arbitrary table attributes (`protected $guarded = []`).
+2. **Customer Cloud Access Token Leaked in Plaintext Logs:** `SyncFileJob::handle()` logs raw customer authentication bearer tokens in cleartext (`Log::info('Sync start', ['token' => ...])`), violating compliance and exposing credentials in log storage.
+3. **Hardcoded API Secrets in Version Control & `APP_DEBUG=true` in Production:** `config/cloud.php` exposes a hardcoded fallback API secret, and `APP_DEBUG=true` exposes sensitive environment variables and credentials on uncaught exceptions.
 
-Following the assignment instructions, this repository includes strictly the relevant application code files, migrations, configurations, and test suites without boilerplate framework bloat:
+---
 
+### 3. Three Things to Check Next (Most Useful First)
+1. **Application & Centralized Logs:** Inspect `storage/logs/laravel.log` and centralized logging to check if customer tokens or secrets were exposed; immediately rotate any compromised credentials.
+2. **Database Performance & Indexes:** Run `SHOW INDEX FROM files;` in MySQL and inspect `mysqld-slow.log` to verify query index coverage across `account_id`, `owner_id`, and `external_id`.
+3. **Queue Health & Dead-Letter Queues:** Run `php artisan queue:failed` and review Redis / Supervisor worker configurations to ensure failed jobs, timeouts, and retries are properly monitored.
+
+---
+
+## Part 2 — Fix the sync job
+
+### 1. Rewritten `handle` Method (`app/Jobs/SyncFileJob.php`)
+
+```php
+class SyncFileJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    public int $tries = 3;                       // Retry transient blips up to 3 times
+    public array $backoff = [15, 60, 300];       // Stepped backoff in seconds
+
+    public function __construct(private readonly array $payload) {}
+
+    public function handle($cloud): void
+    {
+        // Safe logging: token is intentionally excluded to prevent credential leaks
+        Log::info('Sync start', [
+            'account_id' => $this->payload['account_id'],
+            'file'       => $this->payload['external_id'],
+            'attempt'    => $this->attempts(),
+        ]);
+
+        try {
+            $meta = $cloud->fetchMetadata($this->payload['external_id'], $this->payload['token']);
+
+            // Idempotent upsert: safely updates existing records if webhook/job runs twice
+            DB::transaction(fn() => File::updateOrCreate(
+                ['account_id' => $this->payload['account_id'], 'external_id' => $meta['id']],
+                ['owner_id' => $this->payload['owner_id'], 'name' => $meta['name']]
+            ));
+
+            $cloud->markSynced($meta['id']);
+        } catch (CloudFileNotFoundException | CloudPermanentException $e) {
+            // Permanent failure (e.g. 404): fail immediately without retrying
+            Log::warning('Permanent sync error; will not retry', [
+                'file'  => $this->payload['external_id'],
+                'error' => $e->getMessage()
+            ]);
+            $this->fail($e);
+        } catch (Throwable $e) {
+            // Transient outage (5xx / network): rethrow to let queue manage backoff retries
+            Log::error('Transient sync error; queuing retry', [
+                'file'  => $this->payload['external_id'],
+                'error' => $e->getMessage()
+            ]);
+            throw $e;
+        }
+    }
+
+    public function failed(Throwable $exception): void
+    {
+        // Visible alert in logs for ops/monitoring after retries exhausted
+        Log::critical('ALERT: SyncFileJob permanently failed after retries', [
+            'account_id'  => $this->payload['account_id'],
+            'external_id' => $this->payload['external_id'],
+            'error'       => $exception->getMessage(),
+        ]);
+    }
+}
 ```
-├── SUBMISSION.md                                               # Official 2-page take-home response
-├── README.md                                                   # Project documentation & overview
-├── composer.json                                               # PHP 8.2 & Laravel 9 dependencies
-├── .env.example                                                # Hardened environment configuration template
-├── config/
-│   └── cloud.php                                               # Cloud client config (no hardcoded secrets)
-├── app/
-│   ├── Http/
-│   │   └── Controllers/
-│   │       └── FileController.php                              # Fixed SQL injection, N+1 eager loading, IDOR & paging
-│   ├── Models/
-│   │   └── File.php                                            # Model with fillable whitelist & relationships
-│   ├── Jobs/
-│   │   └── SyncFileJob.php                                     # Idempotent queue job with retry backoff & safe logging
-│   ├── Exceptions/
-│   │   └── CloudExceptions.php                                 # Permanent & NotFound exception definitions
-│   └── Services/
-│       └── CloudClient.php                                     # Cloud client contract / interface
-├── database/
-│   └── migrations/
-│       ├── 2024_03_01_000000_create_files_table.php             # Base migration with composite unique index
-│       └── 2024_03_02_000000_add_unique_and_indexes_to_files_table.php # Zero-downtime alter migration
-└── tests/
-    └── Feature/
-        ├── SyncFileJobTest.php                                 # 4 feature tests (idempotency, retries, 404, log masking)
-        └── FileControllerTest.php                              # Tests for search escaping, IDOR tenant isolation
+
+### 2. Migration Change (`database/migrations/2024_03_01_create_files_table.php`)
+
+```php
+Schema::create('files', function (Blueprint $t) {
+    $t->id();
+    $t->unsignedBigInteger('account_id')->index();
+    $t->unsignedBigInteger('owner_id')->index();
+    $t->string('external_id');
+    $t->string('name');
+    $t->boolean('is_shared')->default(false);
+    $t->timestamps();
+
+    // Prevent duplicate records for the same cloud file within an account
+    $t->unique(['account_id', 'external_id'], 'files_account_external_unique');
+
+    // Accelerate scoped search queries (WHERE account_id = ? AND name LIKE ?)
+    $t->index(['account_id', 'name'], 'files_account_name_index');
+});
 ```
 
----
+### 3. Three Tests to Write First (One line each)
+1. **Idempotency Test:** Dispatching `SyncFileJob` twice with the same payload asserts `files` table count remains 1 and record metadata updates without duplication.
+2. **Transient Retry & Failure Alert Test:** When `CloudClient` throws a network/503 exception, assert the job is re-queued with backoff and logs a critical alert upon reaching max tries via `failed()`.
+3. **Permanent Failure (No Retry) Test:** When `CloudClient` throws `CloudFileNotFoundException` (404), assert the job fails immediately without retrying.
 
-## 🛠️ Summary of Fixes
-
-### 1. `app/Http/Controllers/FileController.php`
-- **BRD-301 (SQL Injection):** Eliminated raw SQL string concatenation. Replaced with parameterized Eloquent queries and wildcard escaping (`%` and `_`).
-- **BRD-304 ($N+1$ Query Explosion & Latency):** Eager loads `owner` and `tags` relations (`File::with(...)`) reducing queries from $1+2N$ down to 3 queries total. Added standard pagination (`->paginate(50)`).
-- **Multi-Tenant Security (IDOR):** Scoped all file queries (`show`, `store`, `index`) to the authenticated user's `account_id`. Replaced raw `$request->all()` with validated inputs.
-
-### 2. `database/migrations/`
-- **BRD-309 (Duplicates):** Added composite unique constraint `$table->unique(['account_id', 'external_id'])` to prevent duplicate cloud files under reconnects or concurrent webhooks.
-- **Performance:** Added composite index on `['account_id', 'name']` for fast filtered search, and an index on `owner_id`.
-
-### 3. `app/Jobs/SyncFileJob.php`
-- **Idempotency:** Utilizes `File::updateOrCreate()` inside a database transaction (`DB::transaction`).
-- **Transient Failures:** Configured `$tries = 3` and exponential backoff `$backoff = [15, 60, 300]`. Unhandled transient errors are rethrown so Laravel queue workers handle delays.
-- **Permanent Errors:** Catches `CloudFileNotFoundException` / `CloudPermanentException` and invokes `$this->fail($e)` immediately without retrying.
-- **Security & Privacy:** Redacted authentication tokens completely from log calls. Only non-sensitive metadata (`account_id`, `external_id`, `attempt`) is logged.
-- **Failure Alerting:** Implemented `failed(Throwable $exception)` callback to trigger critical alerts.
-
-### 4. `config/cloud.php` & `.env`
-- Removed hardcoded fallback API keys (`sk_live_...`).
-- Disabled `APP_DEBUG` in production (`APP_DEBUG=false`).
+### 4. Pre-Release Changes & AI Assistance (2-3 lines)
+* **What to change before release:** Add webhook HMAC signature verification to prevent spoofed requests, acquire an atomic Redis lock per `(account_id, external_id)` to prevent concurrent webhook race conditions, and implement Eloquent tenant global scopes / policies.
+* **Where AI helped:** Diagnosed the missing composite unique index causing duplicate records, helped design the transient vs. permanent exception classification pattern, and structured the clean 2-page submission layout.
 
 ---
 
-## 🧪 Testing
+## Appendix: Fixed Files in Repository
 
-The test suite covers all primary edge cases requested in the assignment:
-- **Idempotency:** Ensures duplicate webhooks update existing rows without duplicating records.
-- **Transient Outages:** Verifies retries and backoffs on temporary cloud outages, plus alert logging when retries are exhausted.
-- **Permanent 404s:** Verifies immediate termination without retry for missing files.
-- **Token Protection:** Verifies that bearer tokens are never output to log context.
-- **Multi-Tenant Scoping:** Verifies tenant data isolation between accounts.
+The repository contains strictly the files referenced in Appendix A of the take-home document:
+- [`app/Http/Controllers/FileController.php`](./app/Http/Controllers/FileController.php) (A1)
+- [`app/Models/File.php`](./app/Models/File.php) (A2)
+- [`database/migrations/2024_03_01_create_files_table.php`](./database/migrations/2024_03_01_create_files_table.php) (A2)
+- [`app/Jobs/SyncFileJob.php`](./app/Jobs/SyncFileJob.php) (A3)
+- [`.env.example`](./.env.example) (A4)
+- [`config/cloud.php`](./config/cloud.php) (A4)

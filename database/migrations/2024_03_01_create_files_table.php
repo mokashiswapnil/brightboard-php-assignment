@@ -4,13 +4,14 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
+// database/migrations/2024_03_01_create_files_table.php
 return new class extends Migration
 {
     /**
      * Run the migrations.
      * Fixed schema:
      * - Added unique constraint on ['account_id', 'external_id'] (Fixes BRD-309 duplicates)
-     * - Added composite index on ['account_id', 'name'] (Fixes BRD-304 slow search)
+     * - Added index on ['account_id', 'name'] (Fixes BRD-304 slow search)
      * - Added index on owner_id for user file queries
      */
     public function up(): void
@@ -19,7 +20,7 @@ return new class extends Migration
             $t->id();
             $t->unsignedBigInteger('account_id')->index();
             $t->unsignedBigInteger('owner_id')->index();
-            $t->string('external_id');
+            $t->string('external_id'); // the file's id in the customer's cloud storage
             $t->string('name');
             $t->boolean('is_shared')->default(false);
             $t->timestamps();
