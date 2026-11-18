@@ -4,6 +4,25 @@
 
 ---
 
+## Summary of Changes Made
+
+* **Rewritten Sync Job ([`app/Jobs/SyncFileJob.php`](./app/Jobs/SyncFileJob.php)):**
+  * **Idempotency:** Replaced `File::create()` with `File::updateOrCreate()` keyed by `['account_id', 'external_id']`, ensuring duplicate webhooks/retries never create duplicate rows.
+  * **Transient Retries & Exponential Pause:** Implemented `ShouldBeUnique` with `$tries = 4`, `$backoff = [10, 30, 90]`, and `$uniqueFor = 60` to deduplicate identical jobs in Redis.
+  * **Permanent Error Handling:** Catches `PermanentCloudException` (e.g. 404 / 401) and aborts immediately via `$this->fail($e)` without retrying.
+  * **Security & Token Masking:** Redacted customer OAuth bearer tokens from all log outputs.
+  * **Operator Alerts:** Added `failed(Throwable $exception)` to write clear error messages to `failed_jobs` and alerting channels.
+* **Database Migration ([`database/migrations/2024_03_02_add_indexes_to_files_table.php`](./database/migrations/2024_03_02_add_indexes_to_files_table.php)):**
+  * Added composite unique constraint: `unique(['account_id', 'external_id'])` to block duplicate files at the database layer (BRD-309).
+  * Added composite index: `index(['account_id', 'name'])` to eliminate full table scans on tenant searches (BRD-304).
+* **Configuration & Environment ([`config/cloud.php`](./config/cloud.php) & [`.env.example`](./.env.example)):**
+  * Configured `APP_DEBUG=false` in `.env.example` to prevent SQL query and stack trace exposure (BRD-301).
+  * Removed hardcoded fallback production secret key (`sk_live_...`) from `config/cloud.php`.
+* **Preserved Original Legacy Files ([`FileController.php`](./app/Http/Controllers/FileController.php) & [`File.php`](./app/Models/File.php)):**
+  * Retained original Appendix A code in the repository per instructions (*"You do not need to rewrite the controller (A1) or model (A2) in code. We will talk about those in the interview"*), with comprehensive root cause analysis and recommended fixes documented below.
+
+---
+
 ## Part 1 — Root Cause & Audit
 
 ### 1. Ticket Analysis
