@@ -20,6 +20,7 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
 
     public int $tries = 4;
     public array $backoff = [10, 30, 90]; // Exponential pause between transient retries
+    public int $uniqueFor = 60;           // Deduplicate identical webhooks for 60 seconds
 
     public function __construct(private array $payload) {}
 
@@ -33,7 +34,7 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
     {
         // Never log $this->payload['token']
         Log::info('Sync start', [
-            'account_id' => $this->payload['account_id'],
+            'account_id'  => $this->payload['account_id'],
             'external_id' => $this->payload['external_id'],
         ]);
 
@@ -46,12 +47,12 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
             // Idempotent upsert: safe against duplicate webhooks or job retries
             File::updateOrCreate(
                 [
-                    'account_id' => $this->payload['account_id'],
+                    'account_id'  => $this->payload['account_id'],
                     'external_id' => $meta['id'],
                 ],
                 [
-                    'owner_id' => $this->payload['owner_id'],
-                    'name' => $meta['name'],
+                    'owner_id'    => $this->payload['owner_id'],
+                    'name'        => $meta['name'],
                 ]
             );
 
@@ -59,6 +60,7 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
         } catch (PermanentCloudException $e) {
             // Permanent error (e.g., 404 file not found): fail immediately without retrying
             $this->fail($e);
+            return;
         }
         // Transient exceptions bubble up so Laravel retries according to $tries and $backoff
     }
@@ -67,9 +69,9 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
     {
         // Recorded in Laravel's `failed_jobs` table & surfaced to monitoring/admin alerts
         Log::error('Sync permanently failed', [
-            'account_id' => $this->payload['account_id'],
+            'account_id'  => $this->payload['account_id'],
             'external_id' => $this->payload['external_id'],
-            'error' => $exception->getMessage(),
+            'error'       => $exception->getMessage(),
         ]);
     }
 }

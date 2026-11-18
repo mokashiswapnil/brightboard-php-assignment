@@ -92,6 +92,7 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
 
     public int $tries = 4;
     public array $backoff = [10, 30, 90]; // Exponential pause between transient retries
+    public int $uniqueFor = 60;           // Deduplicate identical webhooks for 60 seconds
 
     public function __construct(private array $payload) {}
 
@@ -131,6 +132,7 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
         } catch (PermanentCloudException $e) {
             // Permanent error (e.g., 404 file not found): fail immediately without retrying
             $this->fail($e);
+            return;
         }
         // Transient exceptions bubble up so Laravel retries according to $tries and $backoff
     }
