@@ -47,7 +47,8 @@ class FileController extends Controller
     }
 
     // POST /api/files
-    // Fixed IDOR and Mass Assignment: Validates input and sets account_id & owner_id from session
+    // Fixed IDOR, Mass Assignment, and Duplicate Key Errors:
+    // Uses updateOrCreate to respect unique(['account_id', 'external_id']) constraint
     public function store(Request $request): JsonResponse
     {
         $validated = $request->validate([
@@ -56,13 +57,17 @@ class FileController extends Controller
             'is_shared'   => ['sometimes', 'boolean'],
         ]);
 
-        $file = File::create([
-            'account_id'  => $request->user()->account_id,
-            'owner_id'    => $request->user()->id,
-            'external_id' => $validated['external_id'],
-            'name'        => $validated['name'],
-            'is_shared'   => $validated['is_shared'] ?? false,
-        ]);
+        $file = File::updateOrCreate(
+            [
+                'account_id'  => $request->user()->account_id,
+                'external_id' => $validated['external_id'],
+            ],
+            [
+                'owner_id'    => $request->user()->id,
+                'name'        => $validated['name'],
+                'is_shared'   => $validated['is_shared'] ?? false,
+            ]
+        );
 
         return response()->json($file, 201);
     }
