@@ -176,11 +176,11 @@ class SyncFileJob implements ShouldQueue, ShouldBeUnique
 
 ---
 
-### 3. First 3 Priority Automated Tests
+### 3. The Three Tests You Would Write First (One Line Each)
 
-1. **Idempotency Test:** Dispatch `SyncFileJob` twice with identical payloads and assert exactly 1 row exists in `files` with updated metadata.
-2. **Transient Retry & Exhaustion Test:** Mock `fetchMetadata()` to throw connection timeouts 4 times and assert the worker retries with backoff before writing to `failed_jobs` and invoking `failed()`.
-3. **Permanent Failure & Token Masking Test:** Mock `fetchMetadata()` to throw `PermanentCloudException` (404) and assert the job fails on attempt 1 without retry and no log entry contains `payload['token']`.
+1. **Duplicate / Idempotency Test:** Dispatch `SyncFileJob` twice with the same `account_id` and `external_id` and assert only one row exists in `files` with the latest metadata.
+2. **Transient Failure & Exhaustion Test:** Mock `CloudClient::fetchMetadata()` to throw a transient 503 timeout across all 4 attempts and assert the job retries with backoff delays before landing in `failed_jobs`.
+3. **Permanent Failure & Log Redaction Test:** Mock `CloudClient::fetchMetadata()` to throw a permanent 404 exception, asserting the job fails immediately on attempt 1 without retries and no log message contains the token.
 
 ---
 
