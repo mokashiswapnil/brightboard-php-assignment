@@ -18,8 +18,11 @@
 * **Configuration & Environment ([`config/cloud.php`](./config/cloud.php) & [`.env.example`](./.env.example)):**
   * Configured `APP_DEBUG=false` in `.env.example` to prevent SQL query and stack trace exposure (BRD-301).
   * Removed hardcoded fallback production secret key (`sk_live_...`) from `config/cloud.php`.
-* **Preserved Original Legacy Files ([`FileController.php`](./app/Http/Controllers/FileController.php) & [`File.php`](./app/Models/File.php)):**
-  * Retained original Appendix A code in the repository per instructions (*"You do not need to rewrite the controller (A1) or model (A2) in code. We will talk about those in the interview"*), with comprehensive root cause analysis and recommended fixes documented below.
+* **Fixed Controller & Model ([`FileController.php`](./app/Http/Controllers/FileController.php) & [`File.php`](./app/Models/File.php)):**
+  * Eliminated SQL injection via parameterized Eloquent queries and wildcard escaping in `index()`.
+  * Resolved N+1 query explosion using eager loading `with(['owner', 'tags'])` and bounded dynamic request pagination (`per_page`).
+  * Patched IDOR in `show()` and `store()` by strictly scoping lookups and assignments to `$request->user()->account_id`.
+  * Added mass assignment protection (`$fillable`) and Eloquent relationships (`owner`, `tags`) in `File.php`.
 
 ---
 

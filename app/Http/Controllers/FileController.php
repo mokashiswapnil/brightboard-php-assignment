@@ -1,35 +1,77 @@
 <?php
 
-// app/Http/Controllers/FileController.php (excerpt)
+// app/Http/Controllers/FileController.php
+
+namespace App\Http\Controllers;
+
+use App\Models\File;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class FileController extends Controller
 {
-    // GET /api/files?search=... used by the file list screen
-    public function index(Request $request)
+    // GET /api/files?search=...&per_page=... used by the file list screen
+    public function index(Request $request): JsonResponse
     {
-        $search = $request->query('search', '');
-        $files = DB::select("SELECT * FROM files WHERE account_id = "
-            . $request->user()->account_id
-            . " AND name LIKE '%" . $search . "%'");
+        $search = (string) $request->query('search', '');
+        $accountId = $request->user()->account_id;
 
-        foreach ($files as $f) {
-            $f->owner = User::find($f->owner_id); // one query per file
-            $f->tags = Tag::where('file_id', $f->id)->get(); // one more per file
-        }
+        // Dynamic pagination from request with safe bounds (default 50, max 100)
+        $perPage = min(max((int) $request->query('per_page', 50), 1), 100);
 
-        return response()->json($files); // every row, no paging
+        // BRD-301 & BRD-304 Fix: Parameterized query builder prevents SQL injection;
+        // Eager-loading ('owner', 'tags') eliminates N+1 queries; pagination bounds memory
+        $files = File::query()
+            ->where('account_id', $accountId)
+            ->when($search !== '', function ($query) use ($search) {
+                $escapedSearch = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $search);
+                $query->where('name', 'LIKE', '%' . $escapedSearch . '%');
+            })
+            ->with([
+                'owner:id,name,email',
+                'tags:id,file_id,name',
+            ])
+            ->orderBy('id', 'desc')
+            ->paginate($perPage);
+
+        return response()->json($files);
     }
 
     // GET /api/files/{id}
-    public function show($id)
+    // Fixed IDOR: Scopes file lookup to the authenticated user's account
+    public function show(Request $request, int $id): JsonResponse
     {
-        return File::findOrFail($id);
+        $file = File::query()
+            ->where('account_id', $request->user()->account_id)
+            ->with(['owner:id,name,email', 'tags:id,file_id,name'])
+            ->findOrFail($id);
+
+        return response()->json($file);
     }
 
     // POST /api/files
-    public function store(Request $request)
+    // Fixed IDOR, Mass Assignment, and Duplicate Key Errors:
+    // Uses updateOrCreate to respect unique(['account_id', 'external_id']) constraint
+    public function store(Request $request): JsonResponse
     {
-        $file = File::create($request->all());
+        $validated = $request->validate([
+            'external_id' => ['required', 'string', 'max:255'],
+            'name'        => ['required', 'string', 'max:255'],
+            'is_shared'   => ['sometimes', 'boolean'],
+        ]);
+
+        $file = File::updateOrCreate(
+            [
+                'account_id'  => $request->user()->account_id,
+                'external_id' => $validated['external_id'],
+            ],
+            [
+                'owner_id'    => $request->user()->id,
+                'name'        => $validated['name'],
+                'is_shared'   => $validated['is_shared'] ?? false,
+            ]
+        );
+
         return response()->json($file, 201);
     }
 }
